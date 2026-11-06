@@ -66,4 +66,3 @@ The first release supports **one doctor / one queue per clinic**. It has real da
 See [product scope](docs/PRODUCT.md) for release requirements and workflow decisions.
 
 Account controls include password changes (which revoke other sessions) and owner removal of staff access. The browser preview may contain a fictional clinic created during verification. Create your own clinic at /register.
-
