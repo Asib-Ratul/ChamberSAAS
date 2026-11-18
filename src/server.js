@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { dirname, resolve, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
  token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS password_resets (
+ token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS visits (
  id TEXT PRIMARY KEY, clinic_id TEXT NOT NULL REFERENCES clinics(id), day TEXT NOT NULL,
  serial INTEGER NOT NULL, name TEXT NOT NULL, token TEXT NOT NULL UNIQUE,
@@ -40,6 +43,7 @@ const id = () => randomBytes(24).toString('hex');
 const now = () => Date.now();
 function day(c) { return new Intl.DateTimeFormat('en-CA', { timeZone: c.timezone, year:'numeric', month:'2-digit', day:'2-digit' }).format(new Date()); }
 function hash(password) { const salt=id(); return salt+':'+scryptSync(password,salt,64).toString('hex'); }
+function hashResetToken(token) { return createHash('sha256').update(token).digest('hex'); }
 function verify(password, stored) { const [salt,key]=stored.split(':'); return timingSafeEqual(scryptSync(password,salt,64),Buffer.from(key,'hex')); }
 function fail(status,message) { const e=new Error(message); e.status=status; throw e; }
 function str(value,label,max=100) { if(typeof value!=='string'||!value.trim()||value.trim().length>max) fail(400,label+' is required (up to '+max+' characters).'); return value.trim(); }
@@ -58,6 +62,11 @@ async function body(req) {
  if(!String(req.headers['content-type']||'').startsWith('application/json')) fail(415,'Send JSON data.');
  let data=''; for await(const chunk of req){data+=chunk; if(data.length>16000) fail(413,'Request is too large.');}
  try{return JSON.parse(data||'{}');}catch{fail(400,'Invalid request data.');}
+}
+async function sendPasswordReset(to, link) {
+ if(!process.env.RESEND_API_KEY||!process.env.MAIL_FROM) fail(503,'Password recovery email is not configured. Please contact your clinic administrator.');
+ const response=await fetch('https://api.resend.com/emails',{method:'POST',headers:{'Authorization':'Bearer '+process.env.RESEND_API_KEY,'Content-Type':'application/json'},body:JSON.stringify({from:process.env.MAIL_FROM,to:[to],subject:'Reset your Chamber password',text:'We received a request to reset your Chamber password. Use this link within one hour:\n\n'+link+'\n\nIf you did not request this, you can ignore this email.'})});
+ if(!response.ok) { const detail=await response.text(); console.error('Password recovery email failed:',response.status,detail.slice(0,300)); fail(503,'We could not send the recovery email. Please try again later.'); }
 }
 function user(req) {
  const cookie=(req.headers.cookie||'').split(';').map(s=>s.trim()).find(s=>s.startsWith('chamber_session='));
@@ -118,6 +127,26 @@ async function api(req,res,path) {
   const valid=u?verify(b.password,u.password):(scryptSync(b.password,'unknown-account',64),false);
   if(!valid) fail(401,'Email or password is incorrect.');
   session(res,u); return {ok:true};
+ }
+ if(path==='/api/password/forgot'&&method==='POST') {
+  limit(req,'password-recovery',5,3600000);
+  const b=await body(req),em=email(b.email),u=db.prepare('SELECT * FROM users WHERE email=?').get(em);
+  if(u) {
+   const raw=randomBytes(32).toString('hex'),tokenHash=hashResetToken(raw),expires=now()+3600000;
+   db.prepare('DELETE FROM password_resets WHERE user_id=?').run(u.id);
+   db.prepare('INSERT INTO password_resets VALUES (?,?,?)').run(tokenHash,u.id,expires);
+   const origin=process.env.APP_ORIGIN||'http://'+req.headers.host;
+   await sendPasswordReset(em,origin+'/reset-password?token='+raw);
+  }
+  return {ok:true,message:'If an account exists for that email, a recovery link will be sent.'};
+ }
+ if(path==='/api/password/reset'&&method==='POST') {
+  limit(req,'password-reset',10);
+  const b=await body(req),pw=password(b.password);
+  if(typeof b.token!=='string'||!/^[a-f0-9]{64}$/.test(b.token)) fail(400,'This recovery link is invalid or expired. Request a new one.');
+  const newHash=hash(pw);
+  transaction(()=>{const reset=db.prepare('SELECT * FROM password_resets WHERE token_hash=? AND expires>?').get(hashResetToken(b.token),now());if(!reset) fail(400,'This recovery link is invalid or expired. Request a new one.');db.prepare('UPDATE users SET password=? WHERE id=?').run(newHash,reset.user_id);db.prepare('DELETE FROM sessions WHERE user_id=?').run(reset.user_id);db.prepare('DELETE FROM password_resets WHERE user_id=?').run(reset.user_id);});
+  return {ok:true};
  }
  if(path==='/api/logout'&&method==='POST') {
   const u=user(req), token=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('chamber_session='))?.slice(16);
